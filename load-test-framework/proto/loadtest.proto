@@ -24,7 +24,7 @@ import "google/protobuf/timestamp.proto";
 option java_package = "com.google.pubsub.flic.common";
 option java_outer_classname = "LoadtestProto";
 
-option go_package = "com.google.pubsub.flic.common";
+option go_package = "google.com/cloud_pubsub_loadtest/internal/genproto";
 
 service LoadtestWorker {
   // Starts a worker
