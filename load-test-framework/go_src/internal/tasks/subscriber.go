@@ -17,7 +17,7 @@
 package tasks
 
 import (
-	"cloud.google.com/go/pubsub"
+	"cloud.google.com/go/pubsub/v2"
 	"context"
 	"go/types"
 	"google.com/cloud_pubsub_loadtest/internal/genproto"
@@ -45,7 +45,7 @@ func (subscriberWorkerFactory) runWorker(
 		log.Fatalf("Failed to create client: %v", err)
 	}
 
-	subscriber := client.Subscription(request.GetPubsubOptions().Subscription)
+	subscriber := client.Subscriber(request.GetPubsubOptions().Subscription)
 	subscriber.ReceiveSettings.MaxOutstandingMessages = kOverallMessages
 	numWorkers := util.ScaledNumWorkers(int(request.CpuScaling))
 	subscriber.ReceiveSettings.MaxOutstandingBytes = kBytesPerWorker * numWorkers

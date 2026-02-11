@@ -17,7 +17,7 @@
 package tasks
 
 import (
-	"cloud.google.com/go/pubsub"
+	"cloud.google.com/go/pubsub/v2"
 	"context"
 	"github.com/golang/protobuf/ptypes"
 	"go/types"
@@ -97,7 +97,7 @@ func (worker *publisherWorker) loopingPublisher(request genproto.StartRequest) {
 
 	options := request.GetPublisherOptions()
 
-	topic := client.Topic(request.Topic)
+	topic := client.Publisher(request.Topic)
 	topic.PublishSettings.ByteThreshold = 9500000
 	topic.PublishSettings.CountThreshold = int(options.BatchSize)
 	delay, err := ptypes.Duration(options.BatchDuration)
