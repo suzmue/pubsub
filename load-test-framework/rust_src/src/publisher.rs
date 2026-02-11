@@ -44,6 +44,7 @@ impl PublisherTask {
         if self.batch_size > 0 {
             publisher_builder = publisher_builder.set_message_count_threshold(self.batch_size as u32);
         }
+        publisher_builder = publisher_builder.set_byte_threshold(9500000);
         
         let publisher = publisher_builder.build();
         
