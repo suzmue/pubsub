@@ -4,7 +4,7 @@ use crate::subscriber::SubscriberTask;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep_until, timeout, Instant};
+use tokio::time::timeout;
 use tonic::{Request, Response, Status};
 
 pub mod loadtest {
@@ -59,43 +59,56 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
             1
         };
 
-        let task: JoinHandle<()> = match request.client_options {
+        let mut worker_handles = Vec::with_capacity(num_workers);
+
+        match request.client_options {
             Some(loadtest::start_request::ClientOptions::PublisherOptions(options)) => {
                 let batch_duration = options.batch_duration.map(|d| {
                     std::time::Duration::new(d.seconds as u64, d.nanos as u32)
                 });
-                let task = PublisherTask::new(
-                    request.project.clone(),
-                    request.topic.clone(),
-                    options.rate,
-                    batch_duration,
-                    options.batch_size,
-                    options.message_size,
-                    num_workers,
-                );
-                tokio::spawn(async move {
-                    if let Ok(duration) = start_time.duration_since(SystemTime::now()) {
-                        sleep_until(Instant::now() + duration).await;
-                    }
-                    let _ = timeout(test_duration, task.run(metrics)).await;
-                })
+                // Go divides rate by NumCPU, but spawns cpu_scaling * NumCPU workers.
+                // Total rate = (rate / NumCPU) * (cpu_scaling * NumCPU) = rate * cpu_scaling.
+                let per_worker_rate = options.rate / num_cpus as f32;
+
+                for i in 0..num_workers {
+                    let task = PublisherTask::new(
+                        request.project.clone(),
+                        request.topic.clone(),
+                        per_worker_rate,
+                        batch_duration,
+                        options.batch_size,
+                        options.message_size,
+                        i,
+                    );
+                    let metrics = metrics.clone();
+                    worker_handles.push(tokio::spawn(async move {
+                        if let Ok(duration) = start_time.duration_since(SystemTime::now()) {
+                            tokio::time::sleep(duration).await;
+                        }
+                        let _ = timeout(test_duration, task.run(metrics)).await;
+                    }));
+                }
             }
             Some(loadtest::start_request::ClientOptions::SubscriberOptions(_)) => {
                 let subscription = match request.options {
                     Some(loadtest::start_request::Options::PubsubOptions(options)) => options.subscription,
                     None => return Err(Status::invalid_argument("No pubsub options specified")),
                 };
-                let task = SubscriberTask::new(request.project.clone(), subscription.clone(), num_workers);
-                tokio::spawn(async move {
-                    if let Ok(duration) = start_time.duration_since(SystemTime::now()) {
-                        sleep_until(Instant::now() + duration).await;
-                    }
-                    let _ = timeout(test_duration, task.run(metrics)).await;
-                })
+                for i in 0..num_workers {
+                    let task = SubscriberTask::new(request.project.clone(), subscription.clone(), i);
+                    let metrics = metrics.clone();
+                    worker_handles.push(tokio::spawn(async move {
+                        if let Ok(duration) = start_time.duration_since(SystemTime::now()) {
+                            tokio::time::sleep(duration).await;
+                        }
+                        let _ = timeout(test_duration, task.run(metrics)).await;
+                    }));
+                }
             }
             None => return Err(Status::invalid_argument("No task specified")),
         };
-        *self.task.lock().unwrap() = Some(vec![task]);
+
+        *self.task.lock().unwrap() = Some(worker_handles);
         Ok(Response::new(loadtest::StartResponse {}))
     }
 
