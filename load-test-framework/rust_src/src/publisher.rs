@@ -43,7 +43,7 @@ impl PublisherTask {
     pub async fn run(&self, metrics: MetricsTracker) {
         let topic_name = format!("projects/{}/topics/{}", self.project_id, self.topic_id);
         let mut builder = Publisher::builder(topic_name)
-            .with_grpc_subchannel_count(8);
+            .with_grpc_subchannel_count(4);
         
         // Match Go's default delay threshold if not provided.
         let delay = self.batch_duration.unwrap_or(Duration::from_millis(10));
@@ -51,7 +51,7 @@ impl PublisherTask {
         
         if self.batch_size > 0 {
             builder = builder.set_message_count_threshold(self.batch_size as u32);
-        }
+        } 
         builder = builder.set_byte_threshold(9500000);
         
         let publisher = Arc::new(builder.build().await.unwrap());
@@ -80,9 +80,9 @@ impl PublisherTask {
                 let mut ticker = per_worker_rate.map(|r| interval(Duration::from_secs_f64(1.0 / r as f64)));
                 
                 // If no rate is specified, we limit outstanding requests to avoid OOM.
-                // 5000 outstanding requests per worker is a reasonable starting point.
+                // 20000 outstanding requests per worker is a reasonable starting point.
                 let semaphore = if per_worker_rate.is_none() {
-                    Some(Arc::new(Semaphore::new(5000)))
+                    Some(Arc::new(Semaphore::new(20000)))
                 } else {
                     None
                 };
