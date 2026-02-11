@@ -163,6 +163,7 @@ public class Client {
       requestBuilder.setCpuScaling(PUBLISHER_CPU_SCALING);
     } else {
       requestBuilder.setCpuScaling(params.getTestParameters().subscriberCpuScaling());
+      requestBuilder.setSubscriberOptions(LoadtestProto.SubscriberOptions.getDefaultInstance());
       if (params.getClientType().isCps()) {
         requestBuilder.setPubsubOptions(PubsubOptions.newBuilder().setSubscription(SUBSCRIPTION));
       }

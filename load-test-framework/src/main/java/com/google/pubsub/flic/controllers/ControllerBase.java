@@ -27,6 +27,7 @@ import com.google.pubsub.flic.common.MessageTracker;
 import com.google.pubsub.flic.controllers.resource_controllers.ComputeResourceController;
 import com.google.pubsub.flic.controllers.resource_controllers.ResourceController;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.stream.Collectors;
@@ -39,7 +40,7 @@ public abstract class ControllerBase implements Controller {
   protected final ScheduledExecutorService executor;
   private final List<ResourceController> controllers;
   private final List<ComputeResourceController> computeControllers;
-  private final Map<ClientType, LatencyTracker> clientLatencyTrackers = new HashMap<>();
+  private final Map<ClientType, LatencyTracker> clientLatencyTrackers = new ConcurrentHashMap<>();
 
   private Timestamp startTime = null;
 
@@ -77,10 +78,7 @@ public abstract class ControllerBase implements Controller {
   }
 
   private LatencyTracker getLatencyTrackerForType(ClientType type) {
-    if (!clientLatencyTrackers.containsKey(type)) {
-      clientLatencyTrackers.put(type, new LatencyTracker());
-    }
-    return clientLatencyTrackers.get(type);
+    return clientLatencyTrackers.computeIfAbsent(type, t -> new LatencyTracker());
   }
 
   @Override

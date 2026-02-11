@@ -1,0 +1,18 @@
+[package]
+name = "rust_worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
+tonic = "0.8"
+prost = "0.11"
+prost-types = "0.11"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+google-cloud-pubsub = "0.32.2-preview"
+serde = { version = "1.0", features = ["derive"] }
+chrono = "0.4"
+futures = "0.3.31"
+
+[build-dependencies]
+tonic-build = "0.8"

@@ -31,6 +31,7 @@ public class ClientType {
     PYTHON,
     RUBY,
     GO,
+    RUST,
     NODE,
     DOTNET
   }

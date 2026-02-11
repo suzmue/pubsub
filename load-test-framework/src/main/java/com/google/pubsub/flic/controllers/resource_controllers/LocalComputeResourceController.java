@@ -139,23 +139,30 @@ public class LocalComputeResourceController extends ComputeResourceController {
     return dir;
   }
 
+  private void runRustProcess(ClientType client, String networkIp, int port) throws IOException {
+    log.info("Starting new rust process.");
+    ProcessBuilder builder =
+        new ProcessBuilder(
+            "./target/debug/rust_worker", "--port=" + port);
+    builder.directory(new File("rust_src"));
+    runCpsProcess(builder);
+  }
+
   private void runClientProcess(ClientType type, Integer port) throws Exception {
-    switch (type.language) {
-      case JAVA:
-        runJavaProcess(type.side, port);
-        return;
-      case PYTHON:
-        runPythonProcess(type.side, port);
-        return;
-      case NODE:
-        runNodeProcess(type.side, port);
-        return;
-      case GO:
-        runGoProcess(type.side, port);
-        return;
+    if (type.language == ClientType.Language.JAVA) {
+      runJavaProcess(type.side, port);
+    } else if (type.language == ClientType.Language.PYTHON) {
+      runPythonProcess(type.side, port);
+    } else if (type.language == ClientType.Language.NODE) {
+      runNodeProcess(type.side, port);
+    } else if (type.language == ClientType.Language.GO) {
+      runGoProcess(type.side, port);
+    } else if (type.language == ClientType.Language.RUST) {
+      runRustProcess(type, "localhost", port);
+    } else {
+      log.error("LocalController does not yet support language: " + type.language);
+      System.exit(1);
     }
-    log.error("LocalController does not yet support language: " + type.language);
-    System.exit(1);
   }
 
   private int getPort() throws IOException {
@@ -189,6 +196,7 @@ public class LocalComputeResourceController extends ComputeResourceController {
 
   @Override
   protected void stopAction() {
+    shutdown.set(true);
     for (Process process : clientProcesses) {
       process.destroy();
     }
