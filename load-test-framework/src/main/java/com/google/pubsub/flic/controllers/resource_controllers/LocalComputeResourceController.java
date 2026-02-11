@@ -143,7 +143,7 @@ public class LocalComputeResourceController extends ComputeResourceController {
     log.info("Starting new rust process.");
     ProcessBuilder builder =
         new ProcessBuilder(
-            "./target/debug/rust_worker", "--port=" + port);
+            "./target/release/rust_worker", "--port=" + port);
     builder.directory(new File("rust_src"));
     runCpsProcess(builder);
   }

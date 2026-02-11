@@ -2,7 +2,9 @@ use crate::metrics::MetricsTracker;
 use crate::publisher::PublisherTask;
 use crate::subscriber::SubscriberTask;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
+use tokio::time::{sleep_until, timeout, Instant};
 use tonic::{Request, Response, Status};
 
 pub mod loadtest {
@@ -12,6 +14,7 @@ pub mod loadtest {
 pub struct LoadtestWorkerImpl {
     metrics: MetricsTracker,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    start_time: Arc<Mutex<Option<SystemTime>>>,
 }
 
 impl LoadtestWorkerImpl {
@@ -19,6 +22,7 @@ impl LoadtestWorkerImpl {
         Self {
             metrics: MetricsTracker::new(),
             task: Arc::new(Mutex::new(None)),
+            start_time: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -31,13 +35,39 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
     ) -> Result<Response<loadtest::StartResponse>, Status> {
         let metrics = self.metrics.clone();
         let request = request.into_inner();
+        
+        metrics.set_include_ids(request.include_ids);
+
+        let start_time = match request.start_time {
+            Some(t) => UNIX_EPOCH + std::time::Duration::new(t.seconds as u64, t.nanos as u32),
+            None => SystemTime::now(),
+        };
+        *self.start_time.lock().unwrap() = Some(start_time);
+
+        let test_duration = match request.test_duration {
+            Some(d) => std::time::Duration::new(d.seconds as u64, d.nanos as u32),
+            None => std::time::Duration::from_secs(3600), // Default 1 hour
+        };
+
         let task: JoinHandle<()> = match request.client_options {
             Some(loadtest::start_request::ClientOptions::PublisherOptions(options)) => {
+                let batch_duration = options.batch_duration.map(|d| {
+                    std::time::Duration::new(d.seconds as u64, d.nanos as u32)
+                });
                 let task = PublisherTask::new(
                     request.project.clone(),
                     request.topic.clone(),
-                    options.rate               );
-                tokio::spawn(async move { task.run(metrics).await })
+                    options.rate,
+                    batch_duration,
+                    options.batch_size,
+                    options.message_size,
+                );
+                tokio::spawn(async move {
+                    if let Ok(duration) = start_time.duration_since(SystemTime::now()) {
+                        sleep_until(Instant::now() + duration).await;
+                    }
+                    let _ = timeout(test_duration, task.run(metrics)).await;
+                })
             }
             Some(loadtest::start_request::ClientOptions::SubscriberOptions(_)) => {
                 let subscription = match request.options {
@@ -45,7 +75,12 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
                     None => return Err(Status::invalid_argument("No pubsub options specified")),
                 };
                 let task = SubscriberTask::new(request.project, subscription);
-                tokio::spawn(async move { task.run(metrics).await })
+                tokio::spawn(async move {
+                    if let Ok(duration) = start_time.duration_since(SystemTime::now()) {
+                        sleep_until(Instant::now() + duration).await;
+                    }
+                    let _ = timeout(test_duration, task.run(metrics)).await;
+                })
             }
             None => return Err(Status::invalid_argument("No task specified")),
         };
@@ -58,8 +93,27 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
         _request: Request<loadtest::CheckRequest>,
     ) -> Result<Response<loadtest::CheckResponse>, Status> {
         let is_finished = self.task.lock().unwrap().as_ref().map_or(true, |t| t.is_finished());
+        let running_duration = self.start_time.lock().unwrap().map(|t| {
+            match SystemTime::now().duration_since(t) {
+                Ok(elapsed) => {
+                    prost_types::Duration {
+                        seconds: elapsed.as_secs() as i64,
+                        nanos: elapsed.subsec_nanos() as i32,
+                    }
+                }
+                Err(e) => {
+                    let negative_elapsed = e.duration();
+                    prost_types::Duration {
+                        seconds: -(negative_elapsed.as_secs() as i64),
+                        nanos: -(negative_elapsed.subsec_nanos() as i32),
+                    }
+                }
+            }
+        });
+
         let mut response = loadtest::CheckResponse {
             is_finished,
+            running_duration,
             ..Default::default()
         };
         self.metrics.export_to(&mut response);

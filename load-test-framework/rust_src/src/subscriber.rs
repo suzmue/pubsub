@@ -1,4 +1,5 @@
 use crate::metrics::MetricsTracker;
+use crate::service::loadtest::MessageIdentifier;
 use google_cloud_pubsub::client::Subscriber;
 use std::time::{Duration, SystemTime};
 
@@ -19,29 +20,51 @@ impl SubscriberTask {
         let subscriber: Subscriber = Subscriber::builder().build().await.unwrap();
         let mut stream = subscriber.streaming_pull(format!("projects/{}/subscriptions/{}", self.project_id, self.subscription_id)).start();
 
-        while let Some((m, h)) = stream.next().await.transpose().unwrap() {
+        while let Some(result) = stream.next().await {
+            let (m, h) = match result {
+                Ok(v) => v,
+                Err(_) => {
+                    metrics.increment_error_count();
+                    continue;
+                }
+            };
+
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_millis();
 
+            let mut latency = None;
             if let Some(send_time_str) = m.attributes.get("sendTime") {
                 if let Ok(send_time) = send_time_str.parse::<u128>() {
-                    let latency = Duration::from_millis((now - send_time) as u64);
-                    metrics.record_latency(latency);
+                    latency = Some(Duration::from_millis((now - send_time) as u64));
                 }
             }
+
+            let mut publisher_client_id = 0;
             if let Some(client_id_str) = m.attributes.get("clientId") {
-                if let Ok(client_id) = client_id_str.parse::<u64>() {
-                    metrics.record_client_id(client_id);
+                if let Ok(client_id) = client_id_str.parse::<i64>() {
+                    publisher_client_id = client_id;
                 }
             }
+
+            let mut sequence_number = 0;
             if let Some(sequence_number_str) = m.attributes.get("sequenceNumber") {
-                if let Ok(sequence_number) = sequence_number_str.parse::<u64>() {
-                    metrics.record_sequence_number(sequence_number);
+                if let Ok(seq_num) = sequence_number_str.parse::<i32>() {
+                    sequence_number = seq_num;
                 }
             }
-            h.ack();
+
+            if let Some(lat) = latency {
+                metrics.record_success(lat, Some(MessageIdentifier {
+                    publisher_client_id,
+                    sequence_number,
+                }));
+            } else {
+                metrics.record_latency(Duration::from_millis(0));
+            }
+
+            let _ = h.ack();
         }
     }
 }
