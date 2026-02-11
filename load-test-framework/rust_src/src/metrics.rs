@@ -1,33 +1,76 @@
 use crate::service::loadtest::{CheckResponse, MessageIdentifier};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::mpsc;
+
+pub enum MetricUpdate {
+    Success {
+        latency: Duration,
+        id: Option<MessageIdentifier>,
+    },
+    Failure,
+}
 
 #[derive(Clone)]
 pub struct MetricsTracker {
-    buckets: Arc<Vec<AtomicU64>>,
+    buckets: Arc<Mutex<Vec<u64>>>,
     error_count: Arc<AtomicU64>,
     received_messages: Arc<Mutex<Vec<MessageIdentifier>>>,
-    include_ids: Arc<Mutex<bool>>,
+    include_ids: Arc<AtomicBool>,
+    update_tx: mpsc::UnboundedSender<MetricUpdate>,
 }
 
 impl MetricsTracker {
     pub fn new() -> Self {
-        let mut buckets = Vec::with_capacity(128);
-        for _ in 0..128 {
-            buckets.push(AtomicU64::new(0));
-        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<MetricUpdate>();
+        let buckets = Arc::new(Mutex::new(Vec::with_capacity(128)));
+        let error_count = Arc::new(AtomicU64::new(0));
+        let received_messages = Arc::new(Mutex::new(Vec::new()));
+        let include_ids = Arc::new(AtomicBool::new(false));
+
+        let buckets_clone = buckets.clone();
+        let error_count_clone = error_count.clone();
+        let received_messages_clone = received_messages.clone();
+        let include_ids_clone = include_ids.clone();
+
+        tokio::spawn(async move {
+            while let Some(update) = rx.recv().await {
+                match update {
+                    MetricUpdate::Success { latency, id } => {
+                        let bucket = Self::bucket_for(latency);
+                        let mut buckets = buckets_clone.lock().unwrap();
+                        while buckets.len() <= bucket {
+                            buckets.push(0);
+                        }
+                        buckets[bucket] += 1;
+
+                        if include_ids_clone.load(Ordering::Relaxed) {
+                            if let Some(id) = id {
+                                if let Ok(mut messages) = received_messages_clone.lock() {
+                                    messages.push(id);
+                                }
+                            }
+                        }
+                    }
+                    MetricUpdate::Failure => {
+                        error_count_clone.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
 
         Self {
-            buckets: Arc::new(buckets),
-            error_count: Arc::new(AtomicU64::new(0)),
-            received_messages: Arc::new(Mutex::new(Vec::new())),
-            include_ids: Arc::new(Mutex::new(false)),
+            buckets,
+            error_count,
+            received_messages,
+            include_ids,
+            update_tx: tx,
         }
     }
 
     pub fn set_include_ids(&self, include_ids: bool) {
-        *self.include_ids.lock().unwrap() = include_ids;
+        self.include_ids.store(include_ids, Ordering::Relaxed);
     }
 
     fn bucket_for(latency: Duration) -> usize {
@@ -44,19 +87,7 @@ impl MetricsTracker {
     }
 
     pub fn record_success(&self, latency: Duration, id: Option<MessageIdentifier>) {
-        let bucket = Self::bucket_for(latency);
-        if bucket < self.buckets.len() {
-             self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
-        } else {
-             self.buckets.last().unwrap().fetch_add(1, Ordering::Relaxed);
-        }
-
-        if *self.include_ids.lock().unwrap() {
-            if let Some(id) = id {
-                let mut messages = self.received_messages.lock().unwrap();
-                messages.push(id);
-            }
-        }
+        let _ = self.update_tx.send(MetricUpdate::Success { latency, id });
     }
 
     pub fn record_latency(&self, latency: Duration) {
@@ -64,31 +95,18 @@ impl MetricsTracker {
     }
 
     pub fn increment_error_count(&self) {
-        self.error_count.fetch_add(1, Ordering::Relaxed);
+        let _ = self.update_tx.send(MetricUpdate::Failure);
     }
 
     pub fn export_to(&self, response: &mut CheckResponse) {
-        let mut bucket_values = Vec::with_capacity(self.buckets.len());
-        let mut last_non_zero = 0;
-        let mut found_non_zero = false;
-        for (i, bucket) in self.buckets.iter().enumerate() {
-            let val = bucket.swap(0, Ordering::Relaxed);
-            bucket_values.push(val as i64);
-            if val > 0 {
-                last_non_zero = i;
-                found_non_zero = true;
+        if let Ok(mut buckets) = self.buckets.lock() {
+            response.bucket_values = std::mem::take(&mut *buckets).into_iter().map(|v| v as i64).collect();
+        }
+        
+        if self.include_ids.load(Ordering::Relaxed) {
+            if let Ok(mut messages) = self.received_messages.lock() {
+                response.received_messages = std::mem::take(&mut *messages);
             }
-        }
-        if found_non_zero {
-            bucket_values.truncate(last_non_zero + 1);
-        } else {
-            bucket_values.clear();
-        }
-        response.bucket_values = bucket_values;
-
-        if *self.include_ids.lock().unwrap() {
-            let mut messages = self.received_messages.lock().unwrap();
-            response.received_messages = std::mem::take(&mut *messages);
         }
 
         response.failed = self.error_count.swap(0, Ordering::Relaxed) as i64;

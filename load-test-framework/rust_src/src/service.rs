@@ -13,7 +13,7 @@ pub mod loadtest {
 
 pub struct LoadtestWorkerImpl {
     metrics: MetricsTracker,
-    task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    task: Arc<Mutex<Option<Vec<JoinHandle<()>>>>> ,
     start_time: Arc<Mutex<Option<SystemTime>>>,
 }
 
@@ -64,28 +64,20 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
                 let batch_duration = options.batch_duration.map(|d| {
                     std::time::Duration::new(d.seconds as u64, d.nanos as u32)
                 });
-                let per_worker_rate = options.rate / num_cpus as f32;
-
+                let task = PublisherTask::new(
+                    request.project.clone(),
+                    request.topic.clone(),
+                    options.rate,
+                    batch_duration,
+                    options.batch_size,
+                    options.message_size,
+                    num_workers,
+                );
                 tokio::spawn(async move {
                     if let Ok(duration) = start_time.duration_since(SystemTime::now()) {
                         sleep_until(Instant::now() + duration).await;
                     }
-                    let mut worker_handles = Vec::new();
-                    for _ in 0..num_workers {
-                        let task = PublisherTask::new(
-                            request.project.clone(),
-                            request.topic.clone(),
-                            per_worker_rate,
-                            batch_duration,
-                            options.batch_size,
-                            options.message_size,
-                        );
-                        let metrics = metrics.clone();
-                        worker_handles.push(tokio::spawn(async move {
-                            let _ = timeout(test_duration, task.run(metrics)).await;
-                        }));
-                    }
-                    futures::future::join_all(worker_handles).await;
+                    let _ = timeout(test_duration, task.run(metrics)).await;
                 })
             }
             Some(loadtest::start_request::ClientOptions::SubscriberOptions(_)) => {
@@ -93,24 +85,17 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
                     Some(loadtest::start_request::Options::PubsubOptions(options)) => options.subscription,
                     None => return Err(Status::invalid_argument("No pubsub options specified")),
                 };
+                let task = SubscriberTask::new(request.project.clone(), subscription.clone(), num_workers);
                 tokio::spawn(async move {
                     if let Ok(duration) = start_time.duration_since(SystemTime::now()) {
                         sleep_until(Instant::now() + duration).await;
                     }
-                    let mut worker_handles = Vec::new();
-                    for _ in 0..num_workers {
-                        let task = SubscriberTask::new(request.project.clone(), subscription.clone());
-                        let metrics = metrics.clone();
-                        worker_handles.push(tokio::spawn(async move {
-                            let _ = timeout(test_duration, task.run(metrics)).await;
-                        }));
-                    }
-                    futures::future::join_all(worker_handles).await;
+                    let _ = timeout(test_duration, task.run(metrics)).await;
                 })
             }
             None => return Err(Status::invalid_argument("No task specified")),
         };
-        *self.task.lock().unwrap() = Some(task);
+        *self.task.lock().unwrap() = Some(vec![task]);
         Ok(Response::new(loadtest::StartResponse {}))
     }
 
@@ -118,7 +103,9 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
         &self,
         _request: Request<loadtest::CheckRequest>,
     ) -> Result<Response<loadtest::CheckResponse>, Status> {
-        let is_finished = self.task.lock().unwrap().as_ref().map_or(true, |t| t.is_finished());
+        let is_finished = self.task.lock().unwrap().as_ref().map_or(true, |tasks| {
+            tasks.iter().all(|t| t.is_finished())
+        });
         let running_duration = self.start_time.lock().unwrap().map(|t| {
             match SystemTime::now().duration_since(t) {
                 Ok(elapsed) => {
