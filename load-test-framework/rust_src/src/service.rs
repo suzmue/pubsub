@@ -49,15 +49,12 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
             None => std::time::Duration::from_secs(3600), // Default 1 hour
         };
 
-        let cpu_scaling = request.cpu_scaling;
         let num_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let num_workers = if cpu_scaling > 0 {
-            (cpu_scaling as usize) * num_cpus
-        } else {
-            1
-        };
+        
+        // One task per CPU as requested.
+        let num_workers = num_cpus;
 
         let mut worker_handles = Vec::with_capacity(num_workers);
 
@@ -66,9 +63,8 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
                 let batch_duration = options.batch_duration.map(|d| {
                     std::time::Duration::new(d.seconds as u64, d.nanos as u32)
                 });
-                // Go divides rate by NumCPU, but spawns cpu_scaling * NumCPU workers.
-                // Total rate = (rate / NumCPU) * (cpu_scaling * NumCPU) = rate * cpu_scaling.
-                let per_worker_rate = options.rate / num_cpus as f32;
+                // Divide total rate by number of workers (CPUs)
+                let per_worker_rate = options.rate / num_workers as f32;
 
                 for i in 0..num_workers {
                     let task = PublisherTask::new(

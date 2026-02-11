@@ -43,7 +43,7 @@ impl PublisherTask {
     pub async fn run(&self, metrics: MetricsTracker) {
         let topic_name = format!("projects/{}/topics/{}", self.project_id, self.topic_id);
         let mut builder = Publisher::builder(topic_name)
-            .with_grpc_subchannel_count(1); // One connection per worker to match Go
+            .with_grpc_subchannel_count(4); 
         
         let delay = self.batch_duration.unwrap_or(Duration::from_millis(10));
         builder = builder.set_delay_threshold(delay);

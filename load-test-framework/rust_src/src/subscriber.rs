@@ -20,14 +20,15 @@ impl SubscriberTask {
 
     pub async fn run(&self, metrics: MetricsTracker) {
         let subscriber: Subscriber = Subscriber::builder()
-            .with_grpc_subchannel_count(1) // One connection per worker to match Go
+            .with_grpc_subchannel_count(4)
             .build()
             .await
             .unwrap();
             
         let mut stream = subscriber
             .streaming_pull(format!("projects/{}/subscriptions/{}", self.project_id, self.subscription_id))
-            .set_max_outstanding_messages(10000)
+            .set_max_outstanding_messages(100000)
+            .set_max_outstanding_bytes(100 * 1024 * 1024)
             .start();
 
         while let Some(result) = stream.next().await {
