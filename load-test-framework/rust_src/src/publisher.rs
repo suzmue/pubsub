@@ -3,9 +3,8 @@ use crate::service::loadtest::MessageIdentifier;
 use google_cloud_pubsub::client::Publisher;
 use google_cloud_pubsub::model::Message;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::Instant;
+use tokio::time::{Instant, interval};
 use bytes::Bytes;
-use futures::StreamExt;
 use std::sync::Arc;
 
 pub struct PublisherTask {
@@ -44,9 +43,10 @@ impl PublisherTask {
         let mut builder = Publisher::builder(topic_name)
             .with_grpc_subchannel_count(8);
         
-        if let Some(duration) = self.batch_duration {
-            builder = builder.set_delay_threshold(duration);
-        }
+        // Match Go's default delay threshold if not provided.
+        let delay = self.batch_duration.unwrap_or(Duration::from_millis(10));
+        builder = builder.set_delay_threshold(delay);
+        
         if self.batch_size > 0 {
             builder = builder.set_message_count_threshold(self.batch_size as u32);
         }
@@ -56,12 +56,16 @@ impl PublisherTask {
         let data = Bytes::from(vec![0u8; self.message_size as usize]);
         
         let mut worker_handles = Vec::with_capacity(self.num_workers);
+        let per_worker_rate = if self.rate > 0.0 {
+            self.rate / self.num_workers as f32
+        } else {
+            0.0
+        };
 
         for i in 0..self.num_workers {
             let publisher = publisher.clone();
             let metrics = metrics.clone();
             let data = data.clone();
-            let rate = self.rate / self.num_workers as f32;
             
             let client_id = (SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -69,64 +73,20 @@ impl PublisherTask {
                 .as_nanos() as i64).wrapping_add(i as i64);
             let client_id_str = client_id.to_string();
 
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(google_cloud_pubsub::model_ext::PublishFuture, Instant, i32)>();
-            
-            let metrics_for_processor = metrics.clone();
-            tokio::spawn(async move {
-                let mut futures = futures::stream::FuturesUnordered::new();
-                loop {
-                    tokio::select! {
-                        msg = rx.recv() => {
-                            match msg {
-                                Some((p, publish_start, seq_num)) => {
-                                    futures.push(async move {
-                                        (p.await, publish_start, seq_num)
-                                    });
-                                }
-                                None => break,
-                            }
-                        }
-                        Some((result, publish_start, seq_num)) = futures.next() => {
-                            match result {
-                                Ok(_) => {
-                                    metrics_for_processor.record_success(publish_start.elapsed(), Some(MessageIdentifier {
-                                        publisher_client_id: client_id,
-                                        sequence_number: seq_num,
-                                    }));
-                                }
-                                Err(_) => {
-                                    metrics_for_processor.increment_error_count();
-                                }
-                            }
-                        }
-                    }
-                }
-                while let Some((result, publish_start, seq_num)) = futures.next().await {
-                    match result {
-                        Ok(_) => {
-                            metrics_for_processor.record_success(publish_start.elapsed(), Some(MessageIdentifier {
-                                publisher_client_id: client_id,
-                                sequence_number: seq_num,
-                            }));
-                        }
-                        Err(_) => {
-                            metrics_for_processor.increment_error_count();
-                        }
-                    }
-                }
-            });
-
-            worker_handles.push(tokio::task::spawn_blocking(move || {
+            worker_handles.push(tokio::spawn(async move {
                 let mut sequence_number: i32 = 0;
-                let mut last_yield = Instant::now();
+                let mut ticker = if per_worker_rate > 0.0 && per_worker_rate.is_finite() {
+                    Some(interval(Duration::from_secs_f64(1.0 / per_worker_rate as f64)))
+                } else {
+                    None
+                };
+
                 loop {
-                    if rate > 0.0 && rate.is_finite() {
-                        let target_interval = Duration::from_secs_f64(1.0 / rate as f64);
-                        let elapsed = last_yield.elapsed();
-                        if elapsed < target_interval {
-                            std::thread::sleep(target_interval - elapsed);
-                        }
-                        last_yield = Instant::now();
+                    if let Some(t) = &mut ticker {
+                        t.tick().await;
+                    } else {
+                        // In high-throughput mode (no rate limit), yield to allow other tasks to run.
+                        tokio::task::yield_now().await;
                     }
 
                     let now = SystemTime::now()
@@ -143,17 +103,27 @@ impl PublisherTask {
                         ]);
 
                     let publish_start = Instant::now();
-                    let p = publisher.publish(msg);
+                    let fut = publisher.publish(msg);
                     
-                    if tx.send((p, publish_start, sequence_number)).is_err() {
-                        break;
-                    }
+                    let metrics = metrics.clone();
+                    let seq_num = sequence_number;
+                    tokio::spawn(async move {
+                        if fut.await.is_ok() {
+                            metrics.record_success(publish_start.elapsed(), Some(MessageIdentifier {
+                                publisher_client_id: client_id,
+                                sequence_number: seq_num,
+                            }));
+                        } else {
+                            metrics.increment_error_count();
+                        }
+                    });
 
                     sequence_number = sequence_number.wrapping_add(1);
                 }
             }));
         }
 
+        // The run method will be aborted by the timeout in service.rs
         futures::future::join_all(worker_handles).await;
     }
 }

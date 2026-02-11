@@ -1,7 +1,7 @@
 use crate::metrics::MetricsTracker;
 use crate::service::loadtest::MessageIdentifier;
 use google_cloud_pubsub::client::Subscriber;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 
 pub struct SubscriberTask {
@@ -20,7 +20,6 @@ impl SubscriberTask {
     }
 
     pub async fn run(&self, metrics: MetricsTracker) {
-        // Use multiple subchannels for better throughput
         let subscriber: Subscriber = Subscriber::builder()
             .with_grpc_subchannel_count(std::cmp::max(4, self.num_workers))
             .build()
@@ -29,29 +28,30 @@ impl SubscriberTask {
             
         let mut stream = subscriber
             .streaming_pull(format!("projects/{}/subscriptions/{}", self.project_id, self.subscription_id))
-            .set_max_outstanding_messages(10000) // Increase outstanding messages for throughput
+            .set_max_outstanding_messages(10000)
             .start();
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(google_cloud_pubsub::model::Message, google_cloud_pubsub::subscriber::handler::Handler)>();
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
         
+        let mut worker_handles = Vec::with_capacity(self.num_workers);
         for _ in 0..self.num_workers {
-            let metrics_for_processor = metrics.clone();
+            let metrics = metrics.clone();
             let rx = rx.clone();
-            tokio::spawn(async move {
+            worker_handles.push(tokio::spawn(async move {
                 loop {
                     let next = {
                         let mut rx_lock = rx.lock().await;
                         rx_lock.recv().await
                     };
 
-                    let (m, h): (google_cloud_pubsub::model::Message, google_cloud_pubsub::subscriber::handler::Handler) = match next {
+                    let (m, h) = match next {
                         Some(v) => v,
                         None => break,
                     };
 
                     let now = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_millis();
 
@@ -77,17 +77,17 @@ impl SubscriberTask {
                     }
 
                     if let Some(lat) = latency {
-                        metrics_for_processor.record_success(lat, Some(MessageIdentifier {
+                        metrics.record_success(lat, Some(MessageIdentifier {
                             publisher_client_id,
                             sequence_number,
                         }));
                     } else {
-                        metrics_for_processor.record_latency(Duration::from_millis(0));
+                        metrics.record_latency(Duration::from_millis(0));
                     }
 
-                    h.ack();
+                    let _ = h.ack();
                 }
-            });
+            }));
         }
 
         while let Some(result) = stream.next().await {
@@ -102,5 +102,8 @@ impl SubscriberTask {
                 }
             }
         }
+        
+        drop(tx);
+        futures::future::join_all(worker_handles).await;
     }
 }
