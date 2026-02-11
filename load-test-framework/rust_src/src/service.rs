@@ -49,24 +49,43 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
             None => std::time::Duration::from_secs(3600), // Default 1 hour
         };
 
+        let cpu_scaling = request.cpu_scaling;
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let num_workers = if cpu_scaling > 0 {
+            (cpu_scaling as usize) * num_cpus
+        } else {
+            1
+        };
+
         let task: JoinHandle<()> = match request.client_options {
             Some(loadtest::start_request::ClientOptions::PublisherOptions(options)) => {
                 let batch_duration = options.batch_duration.map(|d| {
                     std::time::Duration::new(d.seconds as u64, d.nanos as u32)
                 });
-                let task = PublisherTask::new(
-                    request.project.clone(),
-                    request.topic.clone(),
-                    options.rate,
-                    batch_duration,
-                    options.batch_size,
-                    options.message_size,
-                );
+                let per_worker_rate = options.rate / num_cpus as f32;
+
                 tokio::spawn(async move {
                     if let Ok(duration) = start_time.duration_since(SystemTime::now()) {
                         sleep_until(Instant::now() + duration).await;
                     }
-                    let _ = timeout(test_duration, task.run(metrics)).await;
+                    let mut worker_handles = Vec::new();
+                    for _ in 0..num_workers {
+                        let task = PublisherTask::new(
+                            request.project.clone(),
+                            request.topic.clone(),
+                            per_worker_rate,
+                            batch_duration,
+                            options.batch_size,
+                            options.message_size,
+                        );
+                        let metrics = metrics.clone();
+                        worker_handles.push(tokio::spawn(async move {
+                            let _ = timeout(test_duration, task.run(metrics)).await;
+                        }));
+                    }
+                    futures::future::join_all(worker_handles).await;
                 })
             }
             Some(loadtest::start_request::ClientOptions::SubscriberOptions(_)) => {
@@ -74,12 +93,19 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
                     Some(loadtest::start_request::Options::PubsubOptions(options)) => options.subscription,
                     None => return Err(Status::invalid_argument("No pubsub options specified")),
                 };
-                let task = SubscriberTask::new(request.project, subscription);
                 tokio::spawn(async move {
                     if let Ok(duration) = start_time.duration_since(SystemTime::now()) {
                         sleep_until(Instant::now() + duration).await;
                     }
-                    let _ = timeout(test_duration, task.run(metrics)).await;
+                    let mut worker_handles = Vec::new();
+                    for _ in 0..num_workers {
+                        let task = SubscriberTask::new(request.project.clone(), subscription.clone());
+                        let metrics = metrics.clone();
+                        worker_handles.push(tokio::spawn(async move {
+                            let _ = timeout(test_duration, task.run(metrics)).await;
+                        }));
+                    }
+                    futures::future::join_all(worker_handles).await;
                 })
             }
             None => return Err(Status::invalid_argument("No task specified")),
