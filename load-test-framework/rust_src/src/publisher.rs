@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{Instant, interval};
 use bytes::Bytes;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
+use futures::stream::{StreamExt, FuturesUnordered};
 
 pub struct PublisherTask {
     project_id: String,
@@ -57,9 +59,9 @@ impl PublisherTask {
         
         let mut worker_handles = Vec::with_capacity(self.num_workers);
         let per_worker_rate = if self.rate > 0.0 {
-            self.rate / self.num_workers as f32
+            Some(self.rate / self.num_workers as f32)
         } else {
-            0.0
+            None
         };
 
         for i in 0..self.num_workers {
@@ -75,55 +77,70 @@ impl PublisherTask {
 
             worker_handles.push(tokio::spawn(async move {
                 let mut sequence_number: i32 = 0;
-                let mut ticker = if per_worker_rate > 0.0 && per_worker_rate.is_finite() {
-                    Some(interval(Duration::from_secs_f64(1.0 / per_worker_rate as f64)))
+                let mut ticker = per_worker_rate.map(|r| interval(Duration::from_secs_f64(1.0 / r as f64)));
+                
+                // If no rate is specified, we limit outstanding requests to avoid OOM.
+                // 5000 outstanding requests per worker is a reasonable starting point.
+                let semaphore = if per_worker_rate.is_none() {
+                    Some(Arc::new(Semaphore::new(5000)))
                 } else {
                     None
                 };
 
+                let mut futures = FuturesUnordered::new();
+
                 loop {
-                    if let Some(t) = &mut ticker {
-                        t.tick().await;
-                    } else {
-                        // In high-throughput mode (no rate limit), yield to allow other tasks to run.
-                        tokio::task::yield_now().await;
-                    }
+                    tokio::select! {
+                        permit = async {
+                            if let Some(t) = &mut ticker {
+                                t.tick().await;
+                                None
+                            } else if let Some(s) = &semaphore {
+                                Some(s.clone().acquire_owned().await.unwrap())
+                            } else {
+                                unreachable!()
+                            }
+                        } => {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis();
 
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis();
+                            let msg = Message::new()
+                                .set_data(data.clone())
+                                .set_attributes([
+                                    ("sendTime", now.to_string()),
+                                    ("clientId", client_id_str.clone()),
+                                    ("sequenceNumber", sequence_number.to_string()),
+                                ]);
 
-                    let msg = Message::new()
-                        .set_data(data.clone())
-                        .set_attributes([
-                            ("sendTime", now.to_string()),
-                            ("clientId", client_id_str.clone()),
-                            ("sequenceNumber", sequence_number.to_string()),
-                        ]);
+                            let publish_start = Instant::now();
+                            let fut = publisher.publish(msg);
+                            
+                            let seq_num = sequence_number;
+                            futures.push(async move {
+                                let result = fut.await;
+                                drop(permit);
+                                (result, publish_start, seq_num)
+                            });
 
-                    let publish_start = Instant::now();
-                    let fut = publisher.publish(msg);
-                    
-                    let metrics = metrics.clone();
-                    let seq_num = sequence_number;
-                    tokio::spawn(async move {
-                        if fut.await.is_ok() {
-                            metrics.record_success(publish_start.elapsed(), Some(MessageIdentifier {
-                                publisher_client_id: client_id,
-                                sequence_number: seq_num,
-                            }));
-                        } else {
-                            metrics.increment_error_count();
+                            sequence_number = sequence_number.wrapping_add(1);
                         }
-                    });
-
-                    sequence_number = sequence_number.wrapping_add(1);
+                        Some((result, publish_start, seq_num)) = futures.next() => {
+                            if result.is_ok() {
+                                metrics.record_success(publish_start.elapsed(), Some(MessageIdentifier {
+                                    publisher_client_id: client_id,
+                                    sequence_number: seq_num,
+                                }));
+                            } else {
+                                metrics.increment_error_count();
+                            }
+                        }
+                    }
                 }
             }));
         }
 
-        // The run method will be aborted by the timeout in service.rs
         futures::future::join_all(worker_handles).await;
     }
 }
