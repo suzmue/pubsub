@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{Instant, interval};
 use bytes::Bytes;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use futures::stream::{StreamExt, FuturesUnordered};
 
 pub struct PublisherTask {
@@ -62,7 +62,6 @@ impl PublisherTask {
             .as_nanos() as i64).wrapping_add(self.worker_id as i64);
         let client_id_str = client_id.to_string();
 
-        let mut sequence_number: i32 = 0;
         let mut ticker = if self.rate > 0.0 && self.rate.is_finite() {
             Some(interval(Duration::from_secs_f64(1.0 / self.rate as f64)))
         } else {
@@ -76,56 +75,82 @@ impl PublisherTask {
             None
         };
 
-        let mut futures = FuturesUnordered::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<(google_cloud_pubsub::model_ext::PublishFuture, Instant, i32, Option<tokio::sync::OwnedSemaphorePermit>)>();
 
-        loop {
-            tokio::select! {
-                permit = async {
-                    if let Some(t) = &mut ticker {
-                        t.tick().await;
-                        None
-                    } else if let Some(s) = &semaphore {
-                        Some(s.clone().acquire_owned().await.unwrap())
-                    } else {
-                        unreachable!()
+        let metrics_clone = metrics.clone();
+        tokio::spawn(async move {
+            let mut futures = FuturesUnordered::new();
+            loop {
+                tokio::select! {
+                    msg = rx.recv() => {
+                        match msg {
+                            Some((fut, start, seq, permit)) => {
+                                futures.push(async move {
+                                    let res = fut.await;
+                                    drop(permit);
+                                    (res, start, seq)
+                                });
+                            }
+                            None => break,
+                        }
                     }
-                } => {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis();
-
-                    let msg = Message::new()
-                        .set_data(data.clone())
-                        .set_attributes([
-                            ("sendTime", now.to_string()),
-                            ("clientId", client_id_str.clone()),
-                            ("sequenceNumber", sequence_number.to_string()),
-                        ]);
-
-                    let publish_start = Instant::now();
-                    let fut = publisher.publish(msg);
-                    
-                    let seq_num = sequence_number;
-                    futures.push(async move {
-                        let result = fut.await;
-                        drop(permit);
-                        (result, publish_start, seq_num)
-                    });
-
-                    sequence_number = sequence_number.wrapping_add(1);
-                }
-                Some((result, publish_start, seq_num)) = futures.next() => {
-                    if result.is_ok() {
-                        metrics.record_success(publish_start.elapsed(), Some(MessageIdentifier {
-                            publisher_client_id: client_id,
-                            sequence_number: seq_num,
-                        }));
-                    } else {
-                        metrics.increment_error_count();
+                    Some((result, publish_start, seq_num)) = futures.next() => {
+                        if result.is_ok() {
+                            metrics_clone.record_success(publish_start.elapsed(), Some(MessageIdentifier {
+                                publisher_client_id: client_id,
+                                sequence_number: seq_num,
+                            }));
+                        } else {
+                            metrics_clone.increment_error_count();
+                        }
                     }
                 }
             }
+            // Process remaining futures after rx is closed
+            while let Some((result, publish_start, seq_num)) = futures.next().await {
+                if result.is_ok() {
+                    metrics_clone.record_success(publish_start.elapsed(), Some(MessageIdentifier {
+                        publisher_client_id: client_id,
+                        sequence_number: seq_num,
+                    }));
+                } else {
+                    metrics_clone.increment_error_count();
+                }
+            }
+        });
+
+        let mut sequence_number: i32 = 0;
+        loop {
+            let permit = if let Some(t) = &mut ticker {
+                t.tick().await;
+                None
+            } else if let Some(s) = &semaphore {
+                Some(s.clone().acquire_owned().await.unwrap())
+            } else {
+                unreachable!()
+            };
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+
+            let msg = Message::new()
+                .set_data(data.clone())
+                .set_attributes([
+                    ("sendTime", now.to_string()),
+                    ("clientId", client_id_str.clone()),
+                    ("sequenceNumber", sequence_number.to_string()),
+                ]);
+
+            let publish_start = Instant::now();
+            let fut = publisher.publish(msg);
+            
+            if tx.send((fut, publish_start, sequence_number, permit)).is_err() {
+                break;
+            }
+
+            sequence_number = sequence_number.wrapping_add(1);
         }
     }
 }
