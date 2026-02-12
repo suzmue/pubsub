@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tonic::{Request, Response, Status};
+use google_cloud_pubsub::client::Publisher;
 
 pub mod loadtest {
     tonic::include_proto!("google.pubsub.loadtest");
@@ -66,13 +67,24 @@ impl loadtest::loadtest_worker_server::LoadtestWorker for LoadtestWorkerImpl {
                 // Divide total rate by number of workers (CPUs)
                 let per_worker_rate = options.rate / num_workers as f32;
 
+                let topic_name = format!("projects/{}/topics/{}", request.project.clone(), request.topic.clone());
+                let mut builder = Publisher::builder(topic_name)
+                    .with_grpc_subchannel_count(16); 
+                
+                let delay = batch_duration.unwrap_or(std::time::Duration::from_millis(10));
+                builder = builder.set_delay_threshold(delay);
+                
+                if options.batch_size > 0 {
+                    builder = builder.set_message_count_threshold(options.batch_size as u32);
+                }
+                builder = builder.set_byte_threshold(9500000);
+                
+                let publisher = builder.build().await.unwrap();
+
                 for i in 0..num_workers {
                     let task = PublisherTask::new(
-                        request.project.clone(),
-                        request.topic.clone(),
+                        publisher.clone(),
                         per_worker_rate,
-                        batch_duration,
-                        options.batch_size,
                         options.message_size,
                         i,
                     );

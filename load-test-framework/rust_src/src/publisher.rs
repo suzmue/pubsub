@@ -10,50 +10,28 @@ use tokio::sync::{Semaphore, mpsc};
 use futures::stream::{StreamExt, FuturesUnordered};
 
 pub struct PublisherTask {
-    project_id: String,
-    topic_id: String,
+    publisher: Publisher,
     rate: f32,
-    batch_duration: Option<Duration>,
-    batch_size: i32,
     message_size: i32,
     worker_id: usize,
 }
 
 impl PublisherTask {
     pub fn new(
-        project_id: String,
-        topic_id: String,
+                publisher: Publisher,
         rate: f32,
-        batch_duration: Option<Duration>,
-        batch_size: i32,
         message_size: i32,
         worker_id: usize,
     ) -> Self {
         Self {
-            project_id,
-            topic_id,
+                        publisher,
             rate,
-            batch_duration,
-            batch_size,
             message_size,
             worker_id,
         }
     }
 
     pub async fn run(&self, metrics: MetricsTracker) {
-        let topic_name = format!("projects/{}/topics/{}", self.project_id, self.topic_id);
-        let mut builder = Publisher::builder(topic_name)
-            .with_grpc_subchannel_count(4); 
-        
-        let delay = self.batch_duration.unwrap_or(Duration::from_millis(10));
-        builder = builder.set_delay_threshold(delay);
-        
-        if self.batch_size > 0 {
-            builder = builder.set_message_count_threshold(self.batch_size as u32);
-        }
-        builder = builder.set_byte_threshold(9500000);
-        
-        let publisher = builder.build().await.unwrap();
         let data = Bytes::from(vec![0u8; self.message_size as usize]);
         
         let client_id = (SystemTime::now()
@@ -68,7 +46,7 @@ impl PublisherTask {
             None
         };
 
-        // If no rate is specified, we limit outstanding requests per worker.
+        // If no rate is specified, we limit outstanding messages per worker.
         let semaphore = if ticker.is_none() {
             Some(Arc::new(Semaphore::new(10000)))
         } else {
@@ -144,7 +122,7 @@ impl PublisherTask {
                 ]);
 
             let publish_start = Instant::now();
-            let fut = publisher.publish(msg);
+            let fut = self.publisher.publish(msg);
             
             if tx.send((fut, publish_start, sequence_number, permit)).is_err() {
                 break;
